@@ -90,6 +90,11 @@ def fetch_garmin_data(email, password):
     except:
         pass
 
+    try:
+        data["stats"] = client.get_stats(date.today().isoformat())
+    except:
+        data["stats"] = {}
+
     return data
 
 def summarize_for_prompt(data):
@@ -149,9 +154,10 @@ def summarize_for_prompt(data):
         lines.append("\nHRV (rådata, trunkerad):")
         lines.append(str(data["hrv"])[:300])
 
-vo2_val = "N/A"
+    vo2_val = "N/A"
     try:
-        vo2_val = data.get("training_status", {}).get("mostRecentVO2Max", {}).get("generic", {}).get("vo2MaxValue", "N/A")
+        raw_vo2 = data.get("training_status", {}).get("mostRecentVO2Max", {}).get("generic", {}).get("vo2MaxPreciseValue", "N/A")
+        vo2_val = round(float(raw_vo2), 1) if raw_vo2 != "N/A" else "N/A"    
     except:
         pass
 
@@ -159,25 +165,57 @@ vo2_val = "N/A"
     rhr = "N/A"
     hrv_val = "N/A"
     try:
-        rhr = data.get("hrv", {}).get("hrvSummary", {}).get("baseline", {}).get("balancedLow", 40)
+        rhr = data.get("stats", {}).get("restingHeartRate", "N/A")
         hrv_val = data.get("hrv", {}).get("hrvSummary", {}).get("lastNightAvg", 91)
     except:
         pass
 
     # --- SPARA TILL FIREBASE FIRESTORE ---
+    # --- NYTT: HÄMTA DETALJERAD SÖMN, STRESS, BODY BATTERY OCH STEG ---
+    deep_sleep_min = 0
+    rem_sleep_min = 0
+    bb_max = "N/A"
+    bb_min = "N/A"
+    stress_avg = "N/A"
+    steps = 0
+    
+    try:
+        # Detaljerad sömn (Djupsömn och REM i minuter)
+        if data.get("sleep"):
+            sleep_dto = data["sleep"].get("dailySleepDTO", {})
+            deep_sleep_min = sleep_dto.get("deepSleepSeconds", 0) // 60
+            rem_sleep_min = sleep_dto.get("remSleepSeconds", 0) // 60
+            
+        # Daglig statistik (Body Battery, Stress, Steg)
+        if data.get("stats"):
+            stats = data["stats"]
+            bb_max = stats.get("bodyBatteryHighestValue", "N/A")
+            bb_min = stats.get("bodyBatteryLowestValue", "N/A")
+            stress_avg = stats.get("averageStressLevel", "N/A")
+            steps = stats.get("totalSteps", 0)
+    except Exception as e:
+        print(f"Kunde inte hämta utökad data: {e}")
+
+    # --- SPARA TILL FIREBASE FIRESTORE ---
     today_str = date.today().isoformat()
     dagens_data = {
-        "date": today_str, 
+        "date": today_str,
         "readiness": tr_score,
         "readiness_level": tr_level,
-        "vo2max": vo2_val,  
+        "vo2max": vo2_val,
         "sleep_score": overall_sleep,
         "workout_count": len(activities),
         "löpvolym_km": round(running_volume_km, 1),
         "resting_hr": rhr if isinstance(rhr, (int, float)) else 40,
         "hrv_avg": hrv_val if isinstance(hrv_val, (int, float)) else 91,
-        "ctl_fitness": 65.3,  
-        "atl_fatigue": 91.7   
+        "ctl_fitness": 65.3,
+        "atl_fatigue": 91.7,
+        "deep_sleep_min": deep_sleep_min,
+        "rem_sleep_min": rem_sleep_min,
+        "bb_max": bb_max,
+        "bb_min": bb_min,
+        "stress_avg": stress_avg,
+        "steps": steps
     }
     
     try:
@@ -186,34 +224,127 @@ vo2_val = "N/A"
     except Exception as e:
         print(f"Kunde inte spara till Firebase: {e}")
 
-def ask_gemini(api_key, summary):
+    return "\n".join(lines)
+
+# --- 1. API-ANROP: EXTRAHERA AVANCERAD DATA ---
+def extract_advanced_metrics(data):
+    """Hämtar Readiness, HRV och Load Ratio från din redan nedladdade Garmin-data."""
+    metrics = {
+        "readiness_score": "N/A",
+        "hrv_status": "N/A",
+        "acute_load": "N/A",
+        "chronic_load": "N/A",
+        "load_ratio": "N/A"
+    }
+    
+    tr = data.get("training_readiness")
+    if isinstance(tr, list) and len(tr) > 0:
+        metrics["readiness_score"] = tr[0].get("score", "N/A")
+    elif isinstance(tr, dict):
+        metrics["readiness_score"] = tr.get("score", "N/A")
+
+    hrv = data.get("hrv")
+    if hrv and "hrvSummary" in hrv:
+        metrics["hrv_status"] = hrv["hrvSummary"].get("status", "N/A")
+
+    ts = data.get("training_status")
+    if ts:
+        metrics["acute_load"] = ts.get("mostRecentAcuteLoad", "N/A")
+        metrics["chronic_load"] = ts.get("mostRecentChronicLoad", "N/A")
+        if isinstance(metrics["acute_load"], (int, float)) and isinstance(metrics["chronic_load"], (int, float)):
+            if metrics["chronic_load"] > 0:
+                metrics["load_ratio"] = round(metrics["acute_load"] / metrics["chronic_load"], 2)
+                
+    return metrics
+
+
+# --- 2. TELEGRAM-INTEGRATION: LYSSNA PÅ MANUELLA PASS ---
+def fetch_and_log_telegram_workouts(bot_token, db):
+    """Hämtar dina manuellt skrivna pass i Telegram och sparar i Firestore."""
+    import requests
+    import datetime
+    
+    state_ref = db.collection("system").document("telegram_state")
+    state_doc = state_ref.get()
+    
+    last_update_id = 0
+    if state_doc.exists:
+        last_update_id = state_doc.to_dict().get("last_update_id", 0)
+    
+    url = f"https://api.telegram.org/bot{bot_token}/getUpdates?offset={last_update_id + 1}"
+    new_workouts = []
+    
+    try:
+        response = requests.get(url).json()
+        if response.get("ok") and response.get("result"):
+            for item in response["result"]:
+                update_id = item["update_id"]
+                msg = item.get("message", {})
+                text = msg.get("text", "")
+                
+                if text and not text.startswith("/"):
+                    workout_data = {
+                        "beskrivning": text,
+                        "timestamp": msg.get("date"),
+                        "logged_at": datetime.datetime.now().isoformat()
+                    }
+                    db.collection("manual_workouts").document(str(update_id)).set(workout_data)
+                    new_workouts.append(text)
+                    print(f"Loggade nytt pass från Telegram: {text}")
+                
+                last_update_id = update_id
+            
+            state_ref.set({"last_update_id": last_update_id})
+    except Exception as e:
+        print(f"Kunde inte hämta pass från Telegram: {e}")
+        
+    return new_workouts
+
+
+# --- 3. AI-PROMPTING: JÄGAR-PT ---
+def generate_daily_jagar_plan(api_key, garmin_metrics, recent_workouts):
+    """Låter Gemini analysera allt och ge en daglig stridsorder."""
     client = genai.Client(api_key=api_key)
+    
+    manual_workouts_str = "\n".join([f"- {w}" for w in recent_workouts])
+    if not manual_workouts_str:
+        manual_workouts_str = "- Inga manuellt loggade pass (BJJ/Kroppsvikt) sedan senaste körningen."
 
-    prompt = f"""Du är en elitcoach med inriktning på militär fysträning och förberedelser inför Försvarsmakten.
-Ditt uppdrag är att göra mig redo att få maxpoäng på mönstringens fystester (ISOK-maskinen och cykeltestet) 
-samt att bygga den uthållighet och råstyrka som krävs för att utan problem klara kraven för Jägarsoldat (inklusive Jägartestet/step-test med 20 kg packning, tunga marscher och kroppsviktsstyrka).
+    prompt = f"""Du är en extremt analytisk och stenhård militär fystränare. Ditt uppdrag är att förbereda användaren för mönstring och Försvarsmaktens Jägartester.
+Ditt mål är att maximera användarens kapacitet i cykeltestet (VO2-max), ISOK-maskinen (maxstyrka i ben/rygg) och muskulär uthållighet, UTAN att driva användaren in i överträning.
 
-Analysera följande Garmin-data och ge ett konkret träningsupplägg för kommande vecka.
-Ta hänsyn till min återhämtning (training readiness/sömn) innan du föreslår hårda pass.
+Du har här tillgång till dagens Garmin-data och eventuella manuellt loggade pass (ex. BJJ/kroppsvikt) som Garmin missat.
 
-Styr passen mot dessa tre pelare:
-1. Uthållighet/VO2-max (för att krossa cykeltestet/löpningen).
-2. Tung ben/bål-styrka, särskilt marklyft och benpress (för att maxa ISOK-testet).
-3. Muskulär uthållighet, marsch med ryggsäck och chins/armhävningar (för Jägartestet).
+ANVÄNDARENS STATUS IDAG:
+- Training Readiness: {garmin_metrics.get('readiness_score')} (0-100)
+- HRV Status: {garmin_metrics.get('hrv_status')}
+- Acute/Chronic Load Ratio: {garmin_metrics.get('load_ratio')} (Optimalt ligger runt 0.8-1.3)
+- Nyligen loggade pass (utanför Garmin):
+{manual_workouts_str}
 
-Var specifik med passens genomförande och belastning, men håll svaret kort och kärnfullt.
+UPPGIFT:
+Ge en datadriven, daglig rekommendation. Baserat på statusen, beordra vilket av följande användaren ska fokusera på idag:
+1. KONDITION (Löpning/Cykel för VO2-max eller aerob bas)
+2. MUSKULÄR UTHÅLLIGHET/STYRKA (ISOK-fokus, jägar-step-ups, chins/armhävningar)
+3. VILA / AKTIV ÅTERHÄMTNING (Om Readiness är låg, HRV är obalanserad eller Load Ratio är för hög)
 
-GARMIN-DATA:
-{summary}
+Formulera svaret enligt följande struktur (Svara på svenska):
+- KORT ANALYS: (1-2 meningar om vad datan betyder idag).
+- DAGENS ORDER: (Vilket fokus och varför).
+- FÖRESLAGET PASS: (Specifikt och kärnfullt pass, ex. intervaller, styrkeschema eller vila. Ange duration och intensitet).
 """
+
     response = client.models.generate_content(
-        model=MODEL,
-        contents=prompt,
+        model="gemini-3.5-flash",
+        contents=prompt
     )
     return response.text
 
-def send_telegram(text):
-    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+
+# --- SÄNDARE & HUVUDMOTOR ---
+def send_telegram(text): 
+    import os, requests
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN") 
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
     if bot_token and chat_id:
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
@@ -225,22 +356,30 @@ def send_telegram(text):
             print(f"Kunde inte skicka till Telegram: {e}")
 
 def main():
+    import sys, os
     email, password, api_key = get_credentials()
-    
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+
     if not all([email, password, api_key]):
         print("Fel: Saknar inloggningsuppgifter (Garmin eller Gemini).")
         sys.exit(1)
-        
+
+    print("Hämtar data från Garmin Connect...")
     data = fetch_garmin_data(email, password)
-    summary = summarize_for_prompt(data)
+    
+    print("Sparar basdata till databasen...")
+    summarize_for_prompt(data) # Körs för att spara historik i db
+    
+    print("Analyserar avancerade mätvärden (Readiness/HRV/Load)...")
+    garmin_metrics = extract_advanced_metrics(data)
+    
+    print("Kollar Telegram efter BJJ och kroppsviktspass...")
+    recent_workouts = fetch_and_log_telegram_workouts(bot_token, db)
 
-    print("\n----- SAMMANFATTNING SOM SKICKAS TILL GEMINI -----")
-    print(summary)
+    print("\nFrågar Gemini (Jägar-PT) om dagens order...\n")
+    advice = generate_daily_jagar_plan(api_key, garmin_metrics, recent_workouts)
 
-    print("\nFrågar Gemini om träningsupplägg...\n")
-    advice = ask_gemini(api_key, summary)
-
-    print("----- GEMINIS TRÄNINGSUPPLÄGG -----\n")
+    print("----- GEMINIS DAGLIGA ORDER -----\n")
     print(advice)
     
     send_telegram(advice)

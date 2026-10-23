@@ -261,10 +261,20 @@ Svara kortfattat, auktoritärt och konstruktivt på svenska.
 Fråga: {prompt}"""
 
             with st.chat_message("assistant"):
+                client = genai.Client(api_key=GEMINI_API_KEY)
                 try:
-                    client = genai.Client(api_key=GEMINI_API_KEY)
+                    # 1. Försök med den mest avancerade modellen först
                     response = client.models.generate_content(model="gemini-3.5-flash", contents=full_prompt)
                     st.markdown(response.text)
                     st.session_state.messages.append({"role": "assistant", "content": response.text})
-                except Exception as e:
-                    st.error(f"Kunde inte hämta svar från Gemini: {e}")
+                except Exception as e1:
+                    try:
+                        # 2. Fallback till den stabilare reservmodellen
+                        response = client.models.generate_content(model="gemini-1.5-flash", contents=full_prompt)
+                        st.markdown(response.text)
+                        st.session_state.messages.append({"role": "assistant", "content": response.text})
+                    except Exception as e2:
+                        # 3. Om båda är nere
+                        fel_text = "Jägar-PT:n är tillfälligt otillgänglig på grund av serveröverbelastning hos Google. Försök igen om en stund."
+                        st.error(fel_text)
+                        st.session_state.messages.append({"role": "assistant", "content": fel_text})

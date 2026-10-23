@@ -334,12 +334,26 @@ Formulera svaret enligt följande struktur (Svara på svenska):
 - FÖRESLAGET PASS: (Specifikt och kärnfullt pass, ex. intervaller, styrkeschema eller vila. Ange duration och intensitet).
 """
 
-    response = client.models.generate_content(
-        model="gemini-3.5-flash",
-        contents=prompt
-    )
-    return response.text
-
+    try:
+        # 1. Försök först med den mest avancerade modellen
+        response = client.models.generate_content(
+            model="gemini-3.5-flash",
+            contents=prompt
+        )
+        return response.text
+    except Exception as e1:
+        print(f"Den avancerade modellen är överbelastad ({e1}). Byter till reservmodellen...")
+        try:
+            # 2. Fallback till den mer stabila/tillgängliga modellen
+            response = client.models.generate_content(
+                model="gemini-1.5-flash",
+                contents=prompt
+            )
+            return response.text
+        except Exception as e2:
+            # 3. Om båda är nere
+            print(f"Båda modellerna misslyckades: {e2}")
+            return "Jägar-PT:n är tillfälligt otillgänglig på grund av serveröverbelastning hos Google. Din Garmin-data har dock sparats korrekt i databasen! Försök igen om en stund."
 
 # --- SÄNDARE & HUVUDMOTOR ---
 def send_telegram(text): 
